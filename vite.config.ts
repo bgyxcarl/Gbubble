@@ -7,6 +7,10 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false
   },
+  define: {
+    // Polyfill process.env to avoid "process is not defined" error in browser
+    'process.env': {}
+  },
   server: {
     proxy: {
       '/api': 'http://localhost:8080'
