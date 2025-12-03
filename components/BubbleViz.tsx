@@ -50,9 +50,10 @@ const formatNumber = (num: number) => {
     return num.toFixed(2);
 }
 
-const truncate = (str: string) => {
-    if (str.length <= 10) return str;
-    return `${str.slice(0, 4)}...${str.slice(-4)}`;
+const truncate = (str: any) => {
+    const s = String(str || '');
+    if (s.length <= 10) return s;
+    return `${s.slice(0, 4)}...${s.slice(-4)}`;
 };
 
 const BubbleViz: React.FC<BubbleVizProps> = ({ data, activeType, setActiveType, onAddData, theme, baseAddresses, sharedLabels, refreshLabels }) => {

@@ -344,7 +344,7 @@ const DataEditor: React.FC<DataEditorProps> = ({ data, setData, activeType, setA
             setImportResultMsg(`Success! Saved to Database.\n\nAdded:\n• ${addedNative} to Transactions (Native)\n• ${addedErc20} to Transfers (ERC20)\n\nReason: ${mapping.confidenceReason || 'User Hint + AI Verification'}`);
             setImportStep(3);
 
-        } catch (err) {
+        } catch (err: any) {
             console.error(err);
             setImportResultMsg("Analysis Failed. The file format was too ambiguous.");
             setImportStep(3);
@@ -426,7 +426,7 @@ const DataEditor: React.FC<DataEditorProps> = ({ data, setData, activeType, setA
                   setFetchAddress('');
               }
           }
-      } catch (e) {
+      } catch (e: any) {
           setFetchError('An unexpected error occurred during batch fetch.');
           console.error(e);
       } finally {

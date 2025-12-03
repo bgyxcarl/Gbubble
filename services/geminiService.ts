@@ -69,7 +69,7 @@ export const analyzeChainData = async (transactions: Transaction[], context: 'na
     
     return JSON.parse(text) as GeminiAnalysisResponse;
 
-  } catch (error) {
+  } catch (error: any) {
     console.error("Gemini Analysis Failed:", error);
     return {
       insights: [
@@ -97,49 +97,34 @@ export interface CsvMapping {
   blockIndex: number;
   feeIndex: number;
   hasHeader: boolean;
-  // New fields for smart classification
   detectedType: 'native' | 'erc20' | 'mixed';
   confidenceReason: string;
 }
 
-export const normalizeCsvData = async (csvSnippet: string, userHint: string): Promise<CsvMapping> => {
+export const normalizeCsvData = async (csvSnippet: string, userHint: 'native' | 'erc20' | 'mixed'): Promise<CsvMapping> => {
   const prompt = `
-    You are an expert Blockchain Data Engineer.
-    Perform a strict structural analysis on the provided CSV snippet to map columns to a standardized transaction schema.
+    Analyze this CSV snippet (first 5 lines) of blockchain data.
+    User Hint: The user believes this data is related to "${userHint}".
     
-    User Hint: The user indicated this file contains **${userHint.toUpperCase()}** data.
+    Task: Identify the column indices (0-based) for standard blockchain fields.
+    If a column is missing, use -1.
     
-    CSV Snippet (First 5 rows):
+    Required Fields:
+    - fromIndex (Sender address)
+    - toIndex (Receiver address)
+    - valueIndex (Amount/Quantity)
+    - tokenIndex (Token Symbol/Contract, e.g., USDT, ETH. If native chain data without token col, use -1)
+    - timestampIndex (Date/Time)
+    - hashIndex (Transaction Hash/ID)
+    - methodIndex (Function name, e.g., Transfer, Swap. If missing, -1)
+    - blockIndex (Block number)
+    - feeIndex (Gas Fee/Txn Fee)
+    - hasHeader (boolean, true if first row looks like headers)
+    - detectedType (Enum: 'native', 'erc20', 'mixed') based on columns present (e.g., if Token Symbol exists, likely erc20 or mixed).
+    - confidenceReason (string, brief explanation of why you mapped it this way)
+
+    CSV Snippet:
     ${csvSnippet}
-
-    **Goal**: Accurately map column indices (0-based) and validate the data type using Field Similarity.
-
-    **Step 1: Column Similarity & Synonym Matching**
-    Compare headers against these standard fields. Use semantic similarity:
-    - 'fromIndex': Sender, From, Source, Signer, Wallet (From)
-    - 'toIndex': Receiver, To, Destination, Beneficiary, Wallet (To)
-    - 'valueIndex': Amount, Value, Quantity, Volume, Qty
-    - 'tokenIndex': Symbol, Token, Asset, Currency, Coin Name
-    - 'feeIndex': Txn Fee, Gas, Transaction Fee
-    - 'hashIndex': TxHash, Hash, Transaction ID
-    - 'blockIndex': Block No, Block Height
-    - 'timestampIndex': UnixTimestamp, Date, DateTime, Time
-
-    **Step 2: Content Pattern Analysis (Heuristics)**
-    - **Value Columns**: Look for numeric values. If a column has "ETH" or "$" suffixes (e.g. "0.5 ETH"), it is the Value column, but does NOT automatically mean Native if a Token column exists.
-    - **Token Columns**: Look for short uppercase strings (e.g., "USDT", "WETH", "DAI").
-    - **Addresses**: Look for "0x..." patterns (42 chars).
-    
-    **Step 3: Classification Logic (Logic > Hint)**
-    - **ERC20/Mixed**: Strongly inferred if a 'Token', 'Symbol' or 'Contract' column exists with values other than just 'ETH'.
-    - **Native**: Infer if 'Fee' or 'Gas' columns exist and NO separate 'Token' column exists (or Token is constant 'ETH').
-    - **Conflict Resolution**: If the User Hint is 'erc20' but you see no Token column, check if the 'Value' column implies a token (e.g. "500 USDC") or if the context implies a token export.
-    
-    **Output Requirement**:
-    - Return -1 for missing columns.
-    - In 'confidenceReason', explicitly state which columns matched based on similarity (e.g. "High similarity match: 'Asset' header mapped to tokenIndex").
-
-    Return JSON.
   `;
 
   try {
@@ -149,32 +134,36 @@ export const normalizeCsvData = async (csvSnippet: string, userHint: string): Pr
       config: {
         responseMimeType: "application/json",
         responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-                fromIndex: { type: Type.INTEGER },
-                toIndex: { type: Type.INTEGER },
-                valueIndex: { type: Type.INTEGER },
-                tokenIndex: { type: Type.INTEGER },
-                timestampIndex: { type: Type.INTEGER },
-                hashIndex: { type: Type.INTEGER },
-                methodIndex: { type: Type.INTEGER },
-                blockIndex: { type: Type.INTEGER },
-                feeIndex: { type: Type.INTEGER },
-                hasHeader: { type: Type.BOOLEAN },
-                detectedType: { type: Type.STRING, enum: ['native', 'erc20', 'mixed'] },
-                confidenceReason: { type: Type.STRING }
-            }
+          type: Type.OBJECT,
+          properties: {
+            fromIndex: { type: Type.INTEGER },
+            toIndex: { type: Type.INTEGER },
+            valueIndex: { type: Type.INTEGER },
+            tokenIndex: { type: Type.INTEGER },
+            timestampIndex: { type: Type.INTEGER },
+            hashIndex: { type: Type.INTEGER },
+            methodIndex: { type: Type.INTEGER },
+            blockIndex: { type: Type.INTEGER },
+            feeIndex: { type: Type.INTEGER },
+            hasHeader: { type: Type.BOOLEAN },
+            detectedType: { type: Type.STRING, enum: ['native', 'erc20', 'mixed'] },
+            confidenceReason: { type: Type.STRING },
+          }
         }
       }
     });
+
+    const text = response.text;
+    if (!text) throw new Error("No response from Gemini");
     
-    return JSON.parse(response.text!) as CsvMapping;
-  } catch (e) {
-    console.error("CSV AI Mapping failed, falling back to defaults", e);
-    return { 
-        fromIndex: 0, toIndex: 1, valueIndex: 2, tokenIndex: 3, timestampIndex: -1, 
-        hashIndex: -1, methodIndex: -1, blockIndex: -1, feeIndex: -1,
-        hasHeader: true, detectedType: 'native', confidenceReason: 'AI Analysis failed; falling back to default schema.' 
+    return JSON.parse(text) as CsvMapping;
+  } catch (error) {
+    console.error("CSV Normalization Failed", error);
+    // Fallback default
+    return {
+      fromIndex: -1, toIndex: -1, valueIndex: -1, tokenIndex: -1, 
+      timestampIndex: -1, hashIndex: -1, methodIndex: -1, blockIndex: -1, feeIndex: -1,
+      hasHeader: true, detectedType: 'native', confidenceReason: 'AI Analysis Failed'
     };
   }
 };

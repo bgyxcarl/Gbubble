@@ -1,11 +1,8 @@
 
 import { Transaction, TxType } from '../types';
 
-// Allow API_URL to be defined by build environment, fallback to localhost for development
-// In a React app created with standard tools, process.env.REACT_APP_... is commonly used, 
-// or simply standard process.env if using a modern bundler like Vite (import.meta.env) or Parcel.
-// Assuming standard Node-style env replacement or fallback.
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api';
+// Use relative path for Cloud Run deployment (same origin)
+const API_URL = '/api';
 
 export interface Label {
     address: string;

@@ -1,51 +1,56 @@
 
-const express = require('express');
-const mysql = require('mysql2/promise');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+import express from 'express';
+import pg from 'pg';
+import cors from 'cors';
+import bodyParser from 'body-parser';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const { Pool } = pg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-// Allow port to be defined by the cloud environment (Cloud Run uses 8080 by default)
-const PORT = process.env.PORT || 3001; 
+const PORT = process.env.PORT || 8080; 
 const SECRET_KEY = process.env.JWT_SECRET || 'chainscope_secret_key_change_this';
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' })); // Allow large payload for batch insert
+app.use(bodyParser.json({ limit: '50mb' }));
 
-// MySQL Connection Config
-// Priority: Environment Variables (Cloud) -> Local Defaults
+// --- PostgreSQL Connection Config ---
+// Using the details provided by the user for Cloud SQL
 const dbConfig = {
-    host: process.env.DB_HOST || '127.0.0.1',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'chainscope_v2',
-    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 3306,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || '865691863', // Provided password
+    database: process.env.DB_NAME || 'gbubble',      // Provided DB name
 };
 
-// Handle Socket Path (Common for Google Cloud Run connecting to Cloud SQL via Auth Proxy)
-if (process.env.DB_SOCKET_PATH) {
-    delete dbConfig.host;
-    delete dbConfig.port;
-    dbConfig.socketPath = process.env.DB_SOCKET_PATH;
+// Cloud Run Connection Logic
+const CLOUD_SQL_CONNECTION_NAME = process.env.INSTANCE_CONNECTION_NAME || 'gen-lang-client-0389385347:asia-east2:gbubble';
+
+if (process.env.NODE_ENV === 'production' || process.env.K_SERVICE) {
+    // We are in Cloud Run, use the socket
+    dbConfig.host = `/cloudsql/${CLOUD_SQL_CONNECTION_NAME}`;
+} else {
+    // Local fallback (won't work for Cloud SQL unless using Cloud SQL Proxy, but safe for code structure)
+    dbConfig.host = process.env.DB_HOST || '127.0.0.1';
+    dbConfig.port = 5432;
 }
 
-// MySQL Connection Pool
-const pool = mysql.createPool(dbConfig);
+const pool = new Pool(dbConfig);
 
-// Test Connection on Start
-pool.getConnection()
-    .then(conn => {
-        console.log(`Successfully connected to Database: ${dbConfig.database} at ${dbConfig.socketPath || dbConfig.host}`);
-        conn.release();
+// Test Connection
+pool.connect()
+    .then(client => {
+        console.log(`Successfully connected to PostgreSQL database: ${dbConfig.database} via ${dbConfig.host}`);
+        client.release();
     })
     .catch(err => {
         console.error("Database Connection Failed:", err.message);
+        // Do not crash, let Cloud Run restart if needed, but log error
     });
 
 // --- AUTH MIDDLEWARE ---
@@ -70,13 +75,13 @@ app.post('/api/auth/register', async (req, res) => {
 
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
-        const [result] = await pool.execute(
-            'INSERT INTO users (username, password_hash) VALUES (?, ?)',
+        const result = await pool.query(
+            'INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id',
             [username, hashedPassword]
         );
-        res.status(201).json({ message: 'User created' });
+        res.status(201).json({ message: 'User created', userId: result.rows[0].id });
     } catch (err) {
-        if (err.code === 'ER_DUP_ENTRY') return res.status(409).send('Username exists');
+        if (err.code === '23505') return res.status(409).send('Username exists');
         console.error(err);
         res.status(500).send(err.message);
     }
@@ -86,7 +91,7 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     try {
-        const [rows] = await pool.execute('SELECT * FROM users WHERE username = ?', [username]);
+        const { rows } = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
         if (rows.length === 0) return res.status(401).send('User not found');
 
         const user = rows[0];
@@ -105,7 +110,7 @@ app.post('/api/auth/login', async (req, res) => {
 // 3. Labels (Shared) - GET
 app.get('/api/labels', authenticateToken, async (req, res) => {
     try {
-        const [rows] = await pool.execute('SELECT address, label, tag_type FROM address_labels');
+        const { rows } = await pool.query('SELECT address, label, tag_type FROM address_labels');
         res.json(rows);
     } catch (err) {
         console.error(err);
@@ -117,10 +122,11 @@ app.get('/api/labels', authenticateToken, async (req, res) => {
 app.post('/api/labels', authenticateToken, async (req, res) => {
     const { address, label, tag_type } = req.body;
     try {
-        await pool.execute(
+        await pool.query(
             `INSERT INTO address_labels (address, label, tag_type, updated_by_user_id) 
-             VALUES (?, ?, ?, ?) 
-             ON DUPLICATE KEY UPDATE label = VALUES(label), tag_type = VALUES(tag_type), updated_by_user_id = VALUES(updated_by_user_id)`,
+             VALUES ($1, $2, $3, $4) 
+             ON CONFLICT (address) 
+             DO UPDATE SET label = EXCLUDED.label, tag_type = EXCLUDED.tag_type, updated_by_user_id = EXCLUDED.updated_by_user_id`,
             [address, label, tag_type || 'general', req.user.id]
         );
         res.json({ success: true });
@@ -132,45 +138,67 @@ app.post('/api/labels', authenticateToken, async (req, res) => {
 
 // 5. Save Transactions (Batch)
 app.post('/api/data/sync', authenticateToken, async (req, res) => {
-    const { transactions, type } = req.body; // type: 'native' | 'erc20'
+    const { transactions, type } = req.body; 
     const userId = req.user.id;
     
     if (!transactions || transactions.length === 0) return res.json({ count: 0 });
 
-    const connection = await pool.getConnection();
+    const client = await pool.connect();
     try {
-        await connection.beginTransaction();
+        await client.query('BEGIN');
 
         if (type === 'native') {
-            const sql = `
-                INSERT IGNORE INTO tx_native 
-                (user_id, tx_hash, method, block_number, timestamp, from_addr, to_addr, value, fee, chain_id)
-                VALUES ?
-            `;
-            const values = transactions.map(t => [
-                userId, t.hash, t.method, t.block, new Date(t.timestamp), t.from, t.to, t.value, t.fee || 0, '1' // Assuming '1' for now, can be passed
-            ]);
-            await connection.query(sql, [values]);
+            const chunkSize = 500;
+            for (let i = 0; i < transactions.length; i += chunkSize) {
+                const chunk = transactions.slice(i, i + chunkSize);
+                const values = [];
+                const placeholders = chunk.map((t, idx) => {
+                    const offset = idx * 10;
+                    values.push(
+                        userId, t.hash, t.method, t.block, new Date(t.timestamp), t.from, t.to, t.value, t.fee || 0, '1'
+                    );
+                    return `($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, $${offset+5}, $${offset+6}, $${offset+7}, $${offset+8}, $${offset+9}, $${offset+10})`;
+                }).join(',');
+
+                const sql = `
+                    INSERT INTO tx_native 
+                    (user_id, tx_hash, method, block_number, timestamp, from_addr, to_addr, value, fee, chain_id)
+                    VALUES ${placeholders}
+                    ON CONFLICT (tx_hash, user_id) DO NOTHING
+                `;
+                await client.query(sql, values);
+            }
         } else {
-            const sql = `
-                INSERT IGNORE INTO tx_erc20 
-                (user_id, unique_id, tx_hash, method, block_number, timestamp, from_addr, to_addr, value, token_symbol, chain_id)
-                VALUES ?
-            `;
-            const values = transactions.map(t => [
-                userId, t.id, t.hash, t.method, t.block, new Date(t.timestamp), t.from, t.to, t.value, t.token, '1'
-            ]);
-            await connection.query(sql, [values]);
+            const chunkSize = 500;
+            for (let i = 0; i < transactions.length; i += chunkSize) {
+                const chunk = transactions.slice(i, i + chunkSize);
+                const values = [];
+                const placeholders = chunk.map((t, idx) => {
+                    const offset = idx * 11;
+                    values.push(
+                        userId, t.id, t.hash, t.method, t.block, new Date(t.timestamp), t.from, t.to, t.value, t.token, '1'
+                    );
+                    return `($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, $${offset+5}, $${offset+6}, $${offset+7}, $${offset+8}, $${offset+9}, $${offset+10}, $${offset+11})`;
+                }).join(',');
+
+                const sql = `
+                    INSERT INTO tx_erc20 
+                    (user_id, unique_id, tx_hash, method, block_number, timestamp, from_addr, to_addr, value, token_symbol, chain_id)
+                    VALUES ${placeholders}
+                    ON CONFLICT (unique_id, user_id) DO NOTHING
+                `;
+                await client.query(sql, values);
+            }
         }
 
-        await connection.commit();
+        await client.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
-        await connection.rollback();
+        await client.query('ROLLBACK');
         console.error(err);
         res.status(500).send(err.message);
     } finally {
-        connection.release();
+        client.release();
     }
 });
 
@@ -178,21 +206,26 @@ app.post('/api/data/sync', authenticateToken, async (req, res) => {
 app.get('/api/data', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     try {
-        const [nativeRows] = await pool.execute(
-            'SELECT id, tx_hash as hash, method, block_number as block, timestamp, from_addr as `from`, to_addr as `to`, value, fee, "native" as type FROM tx_native WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5000',
+        const nativeRes = await pool.query(
+            'SELECT id, tx_hash as hash, method, block_number as block, timestamp, from_addr as "from", to_addr as "to", value, fee, \'native\' as type FROM tx_native WHERE user_id = $1 ORDER BY timestamp DESC LIMIT 5000',
             [userId]
         );
-        const [erc20Rows] = await pool.execute(
-            'SELECT unique_id as id, tx_hash as hash, method, block_number as block, timestamp, from_addr as `from`, to_addr as `to`, value, token_symbol as token, "erc20" as type FROM tx_erc20 WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5000',
+        const erc20Res = await pool.query(
+            'SELECT unique_id as id, tx_hash as hash, method, block_number as block, timestamp, from_addr as "from", to_addr as "to", value, token_symbol as token, \'erc20\' as type FROM tx_erc20 WHERE user_id = $1 ORDER BY timestamp DESC LIMIT 5000',
             [userId]
         );
         
-        // Normalize IDs and Types
-        const format = (rows) => rows.map(r => ({ ...r, id: r.id.toString(), value: parseFloat(r.value), fee: r.fee ? parseFloat(r.fee) : undefined }));
+        const format = (rows) => rows.map(r => ({ 
+            ...r, 
+            id: r.id.toString(), 
+            value: parseFloat(r.value), 
+            fee: r.fee ? parseFloat(r.fee) : undefined,
+            timestamp: r.timestamp.toISOString()
+        }));
 
         res.json({
-            native: format(nativeRows),
-            erc20: format(erc20Rows)
+            native: format(nativeRes.rows),
+            erc20: format(erc20Res.rows)
         });
     } catch (err) {
         console.error(err);
@@ -200,11 +233,14 @@ app.get('/api/data', authenticateToken, async (req, res) => {
     }
 });
 
-// Health Check for Cloud Run
-app.get('/health', (req, res) => {
-    res.status(200).send('OK');
+// Serve Static Files (React App)
+app.use(express.static(path.join(__dirname, 'dist')));
+
+// Fallback to React Index
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
 app.listen(PORT, () => {
-    console.log(`Backend running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
